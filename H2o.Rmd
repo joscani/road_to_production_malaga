@@ -1,0 +1,262 @@
+---
+title: "R + H2O: Road to Production "
+subtitle: "Málaga. Master de Ingeniería Informática" 
+author: "José Luis Cañadas Reche"
+date: "Diciembre 2019"
+output:
+  ioslides_presentation:
+    df_print: paged
+    logo: Imagen1.jpg
+    widescreen: yes
+css: 1.css
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+
+## Qué tenemos
+
+* Grandes volumenes de datos
+* Dificultad en poner en producción
+
+
+## Qué se usa en la industria, problemática
+
+* Lenguajes usados por los científicos de datos. R, python
+* Entornos de sistemas no preparados
+* Spark, hadoop
+* Librerías analíticas de spark
+
+
+## Posible solución
+
+* Aunar dos mundos. Facilidad desarrollo y fácil productivización
+* H2o . software libre, basado en java, con apis para R y python y scala
+* DS desarrollan modelo en su lenguaje favorito.
+* Una vez entrenado, descargar modelo y poner en producción en spark es sencillo
+
+
+## Ejemplo
+
+```{r message=FALSE, warning=FALSE, echo = TRUE}
+library(tidyverse)
+library(h2o)
+epa <- read.csv("data/epa.csv")
+head(epa)
+```
+
+## Modelo en h2o {.smaller}
+
+```{r, echo=TRUE, warning=FALSE, message=FALSE, results=FALSE}
+h2o.init(nthreads = 4, max_mem_size = "7g")
+
+```
+
+```{r, results=FALSE, echo=TRUE}
+
+epa_hex <-  as.h2o(epa, destination_frame = "epa_hframe")
+epa_hex[,"parado"] <- h2o.asfactor(epa_hex[,"parado"])
+epa_hex[,"prov"] <- h2o.asfactor(epa_hex[,"prov"])
+
+partition <- h2o.splitFrame(epa_hex, ratios = c(0.6), seed = 13)
+
+x = c("gedad","nforma3","prov")
+y = "parado"
+
+train_df <- partition[[1]]
+validation_df <- partition[[2]]
+
+```
+
+## Modelo en h2o {.smaller}
+
+```{r, echo = TRUE, results=FALSE}
+
+mod_glm <- h2o.glm(
+  model_id = "epa_glm",
+  family = "binomial",
+  nfolds = 3,
+  x = x,
+  y = y,
+  training_frame = train_df)
+
+mod_gbm <- h2o.gbm(
+  model_id = "epa_gbm",
+  nfolds = 3,
+  ntrees = 60,
+  max_depth = 3,
+  # family = "binomial",
+  x = x,
+  y = y,
+  training_frame = train_df)
+
+```
+
+## Modelo en h2o {.smaller}
+
+También tenemos modelos xgboost gracias a `xgboost4j`
+
+```{r, echo = TRUE, results=FALSE}
+mod_xgboost <- h2o.xgboost(
+  model_id = "epa_xgboost",
+  nfolds = 3,
+  ntrees = 60,
+  max_depth = 3,
+  distribution  = "bernoulli",
+  booster = "gbtree",
+  x = x,
+  y = y,
+  training_frame = train_df)
+
+```
+
+
+## Modelo en h2o {.smaller}
+
+```{r, echo = TRUE, results=TRUE}
+mod_glm %>% h2o.performance(newdata = validation_df) %>% h2o.auc()
+mod_gbm %>% h2o.performance(newdata = validation_df) %>% h2o.auc()
+mod_xgboost %>% h2o.performance(newdata = validation_df) %>% h2o.auc()
+```
+
+
+## Salvar modelo para poner en producción
+
+Guardamos un fichero zip con el modelo y un .jar que será el que nos permitirá ponerlo en producción en un entorno con spark. Ese jar sólo hay que bajarlo una vez. Bajamos en primer lugar el de xgboost porque tiene librerías extendidas
+
+Había un problema con los modelos de xgboost, pero esto es software libre, puse un issue y lo apañaron
+
+[issue jira](https://0xdata.atlassian.net/browse/PUBDEV-7133?focusedCommentId=55705&page=com.atlassian.jira.plugin.system.issuetabpanels%3Acomment-tabpanel#comment-55705)
+
+```{r, echo = TRUE, results=FALSE}
+h2o.download_mojo(mod_xgboost, get_genmodel_jar = TRUE, 
+                  genmodel_name = "genmodel_xgboost2.jar")
+
+h2o.download_mojo(mod_glm,)
+
+h2o.download_mojo(mod_gbm)
+
+
+```
+
+
+## Turno de los ingenieros de datos
+
+* Con el jar y el modelo salvado se construye una app de spark
+* Funcionará sin necesidad de tener h2o ni R instalado en ningún sitio
+
+
+## Prueba funcional
+
+* Sería añadir el jar cuando se abre la sesión de spark.
+
+En un spark-shell sería algo como esto.
+
+
+```bash 
+~/spark/spark-2.4.0-bin-hadoop2.7/bin/spark-shell  \
+--conf spark.driver.memory="3g"  \
+--conf spark.executor.memory="2g"  \
+--conf spark.executor.instances=2  \
+--conf spark.executor.cores=2  \
+--jars genmodel_xgboost2.jar
+
+``` 
+
+
+## En spark {.smaller}
+
+
+```scala
+
+import _root_.hex.genmodel.GenModel
+import _root_.hex.genmodel.easy.{EasyPredictModelWrapper, RowData}
+import _root_.hex.genmodel.easy.prediction
+import _root_.hex.genmodel.MojoModel
+import _root_.hex.genmodel.easy.RowData
+import org.apache.spark.sql.types.{StructType, StructField, StringType, IntegerType, DoubleType}
+
+
+// cargar mi modelo 
+val modelPath = "epa_xgboost.zip"
+
+// Cargar datos de test para predecir
+val dataPath = "data/epa_test.csv"
+
+// Import data
+val epa_origin = spark.read.option("header", "true").
+csv(dataPath)
+
+val epa = epa_origin.select(epa_origin.columns.map(c => col(c).cast(StringType)) : _*)
+// Import MOJO model
+val mojo = MojoModel.load(modelPath)
+
+```
+
+
+## En spark {.smaller}
+
+
+```scala
+
+val easyModel = new EasyPredictModelWrapper( 
+                new EasyPredictModelWrapper.Config().
+                setModel(mojo).
+                setConvertUnknownCategoricalLevelsToNa(true).
+                setConvertInvalidNumbersToNa(true))
+
+// -------------
+
+// Convertir  todas las columnas a rowdata
+// -------------
+
+val header = epa.columns
+// TODO: castear en spark antes
+
+// Predict
+val epa_score = epa.map {
+  x =>
+    val r = new RowData
+    header.indices.foreach(idx => r.put(header(idx), x.getAs[String](idx) ))
+    val score = easyModel.predictBinomial(r).classProbabilities
+   (x.getAs[String](0),x.getAs[String](1),x.getAs[String](3), score(1))
+  }.toDF("label","edad","prov","predict")
+  
+  
+epa_score.show(false)
+```
+
+
+## Conclusiones
+
+* En Orange lo hemos probado en caso de uso real
+* Uso de h2o junto con spark usando la librería de R `rsparkling`
+* Generar aplicación en spark que entrena y predice en distribuido usando `h2o`
+* Predicción sobre más de 40 millones de filas y 100 columnas en menos de 10 minutos. Incluyendo lectura de tablas en spark y escribiendo en tabla hive
+
+* Modelos mucho mejores y más rápidos que otras soluciones big data.
+
+
+## Vamos a las demos
+
+* Ejecutar el ejemplo de esta presentación
+* Proyecto gradle para productivizar de verdad. Con IntelliJ IDEA, explicado 
+[aquí](https://muestrear-no-es-pecado.netlify.com/2019/03/12/productivizando-modelos-binarios-con-h20/) pero vamos a ver una versión actualizada
+* Con datos reales en un cluster grande. Predecir un dataframe de 384 millones de filas
+* Informes html de los modelos usando el mojo
+
+
+## Extra: Entrenamiento en distribuido 
+
+* Entrenamiento distribuido con sparkling-water. En R y en spark-scala
+
+![](sparkling-water_architecture-2.png){ width=50% }
+
+
+* Veamos ejemplo en el cluster con R y con Scala
+
+
+
